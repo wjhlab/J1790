@@ -1,0 +1,140 @@
+---
+title: "J1790. CIBERSORT on PDAC Atlas"
+author: "Joe and Luda"
+date: "03/02/2022"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+# Analysis plan
+CIBERSORT:
+
+* Paired Wilcoxon test for pre vs. C4D1 for only the samples we have available
+* Wilcoxon test for pre only: Responders vs. nonresponders (PD + NE) (no arm stratification)
+* Wilcoxon test for pre only: Time on study <90 vs. >90d (no arm stratification)
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE,
+                      warning = FALSE)
+rm(list = ls())
+
+library(dplyr)
+library(ggfortify)
+library(DT)
+library(ComplexHeatmap)
+library(ggpubr)
+
+set.seed(12345)
+
+rootFolder = "C:/Users/Luda/OneDrive - Johns Hopkins/J1790/"
+outputFolder = paste0(rootFolder,"Results/Cibersort/")
+
+timeCol = c(PreTX = 'blue',OnTX = 'red')
+respCol = c(PD = 'red',SD = 'yellow')
+pathCol <- c("non-significant" = "grey", "significant" = "red")
+binaryCol = c('TRUE' = 'black', 'FALSE' = 'grey')
+
+```
+
+```{r, fig.width=10}
+# Load Cibersort data from PDAC atlas
+ciber <- read.csv(file = paste0(rootFolder,"Data/Atlas_Cibersort_100perm/CIBERSORTx_Job35_Results.csv"), row.names = 1)
+
+# Load in SampleAnnot
+SampAnnot <- readRDS(paste0(rootFolder,"Data/SampAnnot.rds"))
+
+# keep cell types only (remove p-values and correlations)
+ciber = ciber[rownames(SampAnnot), 1:19]
+
+# remove cells with all zeros
+ciber = ciber[,colnames(ciber)[which(!apply(ciber == 0, 2, all))]]
+
+# top annotation of the heatmap
+HA <- HeatmapAnnotation(df = SampAnnot[rownames(ciber),c("Response","timeOnStudy90", "Timepoint", "subject.ID")],
+                        col=list(timeOnStudy90 = binaryCol, Response = respCol, Timepoint = timeCol))
+
+Heatmap(t(ciber),
+        top_annotation = HA,
+        clustering_distance_rows = 'pearson', 
+        clustering_distance_columns = 'pearson',
+        row_names_gp = gpar(fontsize = 6), 
+        column_title="CIBERSORT")
+
+# correlation heatmap
+cor_df <- round(cor(ciber), 2)
+
+pheatmap(cor_df)
+
+```
+
+
+# Paired analysis for pre- vs. on-treatment
+
+```{r, fig.width= 7, fig.height=5}
+# select paired samples
+pairedPatID = SampAnnot[which(duplicated(SampAnnot$subject.ID)), "subject.ID"]
+pairedSamp = SampAnnot %>% filter(subject.ID %in% pairedPatID) %>% select(Sample.Name) %>% unlist()
+
+# annotation for paired samples only
+d = SampAnnot[pairedSamp, ]
+pairedPre = d%>% filter(Timepoint == 'PreTX') %>% rownames()
+pairedOn = d%>% filter(Timepoint == 'OnTX') %>% rownames()
+
+# calculate p-values for paired samples
+pairedPvals = sapply(colnames(ciber), function(x) wilcox.test(ciber[pairedPre,x],ciber[pairedOn,x], paired = T)$p.value )
+
+print(pairedPvals[order(pairedPvals)])
+
+
+```
+
+
+## Pre-treatment only: Responders (SD) vs. nonresponders (PD)
+
+```{r}
+# select pre-treated samples only
+pretxSamp = SampAnnot %>% filter(Timepoint == 'PreTX') %>% select(Sample.Name) %>% unlist()
+
+# calculate p-values 
+respPvals = sapply(colnames(ciber), function(x) wilcox.test(ciber[pretxSamp,x] ~ SampAnnot[pretxSamp,'Response'])$p.value )
+
+print(respPvals[order(respPvals)])
+write.csv(respPvals, file = paste0(rootFolder,"Results/Cibersort/Cibersort_pvals.csv"))
+
+# make boxplots for significant ones
+significant = names(respPvals)[which(respPvals < 0.05)]
+
+for(k in significant)
+{ 
+p = ggplot(data.frame(proportion = ciber[pretxSamp,k], Response = SampAnnot[pretxSamp,'Response']), aes(x=Response, y=proportion)) + 
+  geom_boxplot() + 
+  labs(title=k) + 
+  stat_compare_means() + 
+  geom_point() + 
+  theme_bw()
+
+print(p)
+
+}
+
+```
+
+## Pre-treatment only: time on study > 90
+
+```{r}
+# select pre-treated samples only without NA in timeOnStudy
+pretxSamp = SampAnnot %>% filter(Timepoint == 'PreTX' & !is.na(timeOnStudy90)) %>% select(Sample.Name) %>% unlist()
+
+# calculate p-values 
+respPvals = sapply(colnames(ciber), function(x) wilcox.test(ciber[pretxSamp,x] ~ SampAnnot[pretxSamp,'timeOnStudy90'])$p.value )
+
+print(respPvals[order(respPvals)])
+
+
+
+```
+
+
+

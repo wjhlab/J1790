@@ -1,0 +1,228 @@
+---
+title: "J1790. Bulk RNASeq Analysis figures for the paper"
+author: "Ludmila Danilova & Joe Tandurella"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+# DE analysis figures
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE,
+                      warning = FALSE)
+rm(list = ls())
+
+library(DESeq2)
+library(xlsx)
+library(dplyr)
+library(ggfortify)
+library(ggpubr)
+library(DT)
+library(fgsea)
+library(msigdbr)
+library(ComplexHeatmap)
+library('EnhancedVolcano')
+library(data.table)
+
+
+set.seed(12345)
+
+rootFolder = "./"
+outputFolder = "./"
+
+timeCol = c(PreTX = 'blue',OnTX = 'red')
+respCol = c(PD = 'red',SD = 'yellow')
+pathCol <- c("non-significant" = "grey", "significant" = "red")
+binaryCol = c('TRUE' = 'black', 'FALSE' = 'grey')
+
+adjPvalThr = 0.05
+
+# load data
+# save RNAseq counts and sample annotation for further analysis
+load(file = paste0(outputFolder,"RNAseqData.rda"))
+# create DESeq object
+dds <- DESeqDataSetFromMatrix(countData = exprsDat, colData = SampAnnot, design = ~Timepoint+Bestresponse)
+
+# for plotting
+vst <- vst(dds)
+vstDat <- assay(vst)
+vstDat <- vstDat[apply(vstDat,1,sd)>0,]
+
+# select paired samples
+pairedPatID = SampAnnot[which(duplicated(SampAnnot$subject.ID)), "subject.ID"]
+print(c("Patients with paired samples",length(pairedPatID)))
+pairedSamp = SampAnnot %>% filter(subject.ID %in% pairedPatID) %>% select(Sample.Name) %>% unlist()
+
+```
+
+## Paired sifferential expression analysis for pre- vs. on-treatment
+
+
+```{r, fig.width=7, fig.height=5}
+HALLMARK_paired = read.csv(paste0(outputFolder,"pairedDE_Hallmark.csv"))
+
+Sig_HALLMARK <- HALLMARK_paired[HALLMARK_paired$padj < adjPvalThr,]
+
+ggplot(Sig_HALLMARK, aes(reorder(pathway, NES), NES)) +
+      geom_col(fill = 'red') +
+       theme(axis.text.y = element_text(size=10),
+            axis.text.x = element_text(size=12),
+            axis.title.x =  element_text(size=12),
+            axis.title.y =  element_text(size=12)) +
+      coord_flip() +
+      labs(x="Pathway", y="Normalized Enrichment Score",
+           title="Hallmark pathways Enrichment Score from Paired Samples by Time", size = 10) + 
+      theme(plot.title.position = "plot", plot.title = element_text(size=9, face="bold"))
+
+```
+
+## Pre-treatment only: Responders (SD) vs. nonresponders (PD)
+
+```{r, fig.width=7, fig.height=3}
+
+pre = read.csv(file=paste0(outputFolder,"preTx_response_xCell_myeloid.csv"))
+# select sifniciant pathways only
+Sig <- pre[pre$padj < adjPvalThr,]
+
+ggplot(Sig, aes(reorder(pathway, NES), NES)) +
+      geom_col(fill = 'red') +
+      theme(axis.text.y = element_text(size=10),
+            axis.text.x = element_text(size=12),
+            axis.title.x =  element_text(size=12),
+            axis.title.y =  element_text(size=12)) +
+      coord_flip() +
+      labs(x="Pathway", y="Normalized Enrichment Score",
+           title="Myeloid pathways Enrichment Score from PreTX by response", size = 10) + 
+      theme(plot.title.position = "plot", plot.title = element_text(size=9, face="bold"))
+
+
+
+```
+
+# Myeloid gene signature from Project 3
+
+```{r, fig.width=5, fig.height=5}
+myeloidGenes = unlist(read.csv('Myeloid_Genes.csv', nrows = 1, header = F))
+myeloidGenes = intersect(myeloidGenes, rownames(vstDat))
+
+# top annotation of the heatmap
+HA <- HeatmapAnnotation(df = SampAnnot[pairedSamp,c("Timepoint", "subject.ID","Response")],
+                        col=list(Timepoint = timeCol, Response = respCol))
+
+Heatmap(t(apply(vstDat[myeloidGenes, pairedSamp],1,scale)),
+        top_annotation = HA,
+        clustering_distance_rows = 'pearson', 
+        clustering_distance_columns = 'pearson',
+        row_names_gp = gpar(fontsize = 6), 
+        column_labels = SampAnnot[pairedSamp,"subject.ID"],
+        column_title="Myeloid genes. Paired samples",
+        show_row_names  = F)
+# GSEA on myeloid genes
+#Extract Stats for Pathway Analysis from paired analysis
+res_paired = read.csv(file = paste0(outputFolder,"pairedDE_results.csv"), row.names = 1)
+res_paired_stats <- res_paired$log2FoldChange
+names(res_paired_stats) <- row.names(res_paired)
+
+#Extract Stats for Pathway Analysis from preTx analysis
+res_resp = read.csv(file = paste0(outputFolder,"preTx_response_DE_results.csv"), row.names = 1)
+res_resp_stats <- res_resp$log2FoldChange
+names(res_resp_stats) <- row.names(res_resp_stats)
+
+set.seed(123456)
+myeloidGSEA= fgsea(pathways = list(myeloid = myeloidGenes), stats=res_paired_stats)
+print("Pathway analysis using myeloid genes from Project 3 as a set")
+datatable(myeloidGSEA)
+
+```
+
+# CIBERSORTx analysis
+
+
+```{r, fig.width=3, fig.height=3}
+# Load Cibersort data from PDAC atlas
+ciber <- read.csv(file = "CIBERSORTx_Job35_Results.csv", row.names = 1)
+
+# select pre-treated samples only
+pretxSamp = SampAnnot %>% filter(Timepoint == 'PreTX') %>% select(Sample.Name) %>% unlist()
+
+# calculate p-values 
+respPvals = sapply(colnames(ciber), function(x) wilcox.test(ciber[pretxSamp,x] ~ SampAnnot[pretxSamp,'Response'])$p.value )
+
+print(respPvals[order(respPvals)])
+
+# make boxplots for significant ones
+significant = names(respPvals)[which(respPvals < 0.05)]
+
+for(k in significant)
+{ 
+
+p = ggplot(data.frame(proportion = ciber[pretxSamp,k], response = SampAnnot[pretxSamp,'Response']), aes(x=response, y=proportion, fill=response))+
+  geom_boxplot(outlier.size=0, lwd=0.25, color="black")+
+  geom_jitter(width=0)+
+  labs(title=k) + 
+  theme(axis.text.x = element_text(size=10, angle=30, vjust=1, hjust=1, color="black"),
+        axis.text.y = element_text(size=10, color="black"),
+        axis.title.x = element_blank(),
+        axis.line.x = element_line(size=0.5, color="black"),
+        axis.line.y = element_line(size=0.5, color="black"),
+        axis.title.y = element_text(size=12, color="black"),
+        strip.background = element_rect(fill=NA),
+        strip.text = element_text(size=7.5, color="black"),
+        panel.background = element_rect(fill="white"),
+        legend.title = element_blank(),
+        legend.key.size = unit(2,'lines'),
+        legend.text = element_text(size=8),
+        legend.key = element_rect(fill="white")
+  )
+
+  print(p)
+
+}
+
+
+```
+
+# TCR repertoir counts
+
+
+```{r, fig.width=4, fig.height=3}
+# Load TCR data 
+tcr = read.csv(file = "alpha_clone_counts.csv", row.names = 1)
+
+SampAnnot$Clones = tcr[rownames(SampAnnot),"Clones"]
+
+p = ggplot(SampAnnot, aes(x=Timepoint , y=Clones, fill=Timepoint))+
+  geom_boxplot(outlier.size=0, lwd=0.25, color="black")+
+  geom_jitter(width=0)+
+  theme(axis.text.x = element_text(size=10, angle=30, vjust=1, hjust=1, color="black"),
+        axis.text.y = element_text(size=10, color="black"),
+        axis.title.x = element_blank(),
+        axis.line.x = element_line(size=0.5, color="black"),
+        axis.line.y = element_line(size=0.5, color="black"),
+        axis.title.y = element_text(size=12, color="black"),
+        strip.background = element_rect(fill=NA),
+        strip.text = element_text(size=7.5, color="black"),
+        panel.background = element_rect(fill="white"),
+        legend.title = element_blank(),
+        legend.key.size = unit(2,'lines'),
+        legend.text = element_text(size=8),
+        legend.key = element_rect(fill="white")
+  )
+print(p)
+
+print(p+  stat_compare_means())
+
+pdf("J1790_TCR.pdf", width=4, height=3)
+print(p)
+print(p+  stat_compare_means())
+dev.off()
+
+
+```
+
+
+
+

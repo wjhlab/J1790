@@ -1,0 +1,449 @@
+---
+title: "J1790. Bulk RNASeq Analysis for the paper"
+author: "Ludmila Danilova & Joe Tandurella"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+# Analysis plan
+
+- Paired differential analysis for pre vs. C4D1 for only the samples we have available
+- Differential analysis for pre only: Responders vs. nonresponders (PD + NE) (no arm stratification)
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE,
+                      warning = FALSE)
+rm(list = ls())
+
+library(DESeq2)
+library(xlsx)
+library(dplyr)
+library(ggfortify)
+library(DT)
+library(fgsea)
+library(msigdbr)
+library(ComplexHeatmap)
+library('EnhancedVolcano')
+library(data.table)
+
+# function for making barplot wiht GSEA results
+pathBarPlot = function(fgseaRes, signThr = 0.05, ttl = "")
+{
+  fgseaRes$adjPvalue <- ifelse(fgseaRes$padj <= 0.05, "significant", "non-significant")
+  ggplot(fgseaRes, aes(reorder(pathway, NES), NES, fill = adjPvalue)) +
+    geom_col() +
+    scale_fill_manual(values = pathCol) +
+    theme(axis.text.y = element_text(size=5)) +
+    coord_flip() +
+    labs(x="Pathway", y="Normalized Enrichment Score",  title=ttl) + 
+    theme(plot.title.position = "plot", plot.title = element_text(size=8, face="bold"))
+}
+# make barplot of fgsea results
+fgseaBarplot = function(res, 
+                        adjPvalThr = 0.05, 
+                        main_title = "Pathways Enrichment Score",
+                        sig_only = FALSE)
+{
+  ## Complete  Barplot
+  res$adjPvalue <- ifelse(res$padj <= adjPvalThr, "significant", "non-significant")
+  cols <- c("non-significant" = "grey", "significant" = "red")
+  if(!sig_only)
+  {
+    p = ggplot(res, aes(reorder(pathway, NES), NES, fill = adjPvalue)) +
+      geom_col() +
+      scale_fill_manual(values = cols) +
+      theme(axis.text.y = element_text(size=5)) +
+      coord_flip() +
+      labs(x="Pathway", y="Normalized Enrichment Score", title=main_title) + 
+      theme(plot.title.position = "plot", plot.title = element_text(size=8, face="bold"))
+    print(p)
+  }
+  ## Sig Only  Barplot
+  Sig_ORGResHALLMARK <- res[padj < adjPvalThr]
+  if (nrow(Sig_ORGResHALLMARK)==0){ print("No Significant pathways with pAdj < 0.05"
+  )} else {
+    # prints the number of significant pathways
+    cat("The number of significant pathways: ",nrow(Sig_ORGResHALLMARK))
+    ggplot(Sig_ORGResHALLMARK, aes(reorder(pathway, NES), NES, fill = adjPvalue)) +
+      geom_col() +
+      scale_fill_manual(values = cols) +
+      theme(axis.text.y = element_text(size=5)) +
+      coord_flip() +
+      labs(x="Pathway", y="Normalized Enrichment Score",
+           title=paste0("Significant (pAdj<",adjPvalThr,")", main_title)) + 
+      theme(plot.title.position = "plot", plot.title = element_text(size=8, face="bold"))
+  }
+  
+}
+
+
+
+set.seed(12345)
+
+rootFolder = "C:/Users/ldanilo1/OneDrive - Johns Hopkins/J1790/"
+outputFolder = paste0(rootFolder,"Results/RNAseq/")
+
+timeCol = c(PreTX = 'blue',OnTX = 'red')
+respCol = c(PD = 'red',SD = 'yellow')
+pathCol <- c("non-significant" = "grey", "significant" = "red")
+binaryCol = c('TRUE' = 'black', 'FALSE' = 'grey')
+
+```
+
+```{r}
+# Load Gene counts
+#exprsDat <- readRDS("~/OneDrive - Johns Hopkins/J1790/Data/GeneCounts.rds")
+exprsDat <- readRDS(paste0(rootFolder,"Data/RNAseq/GeneCounts.rds"))
+
+##Save for Cibersortx
+#write.table(cbind(Genes = rownames(exprsDat), exprsDat), file = "~/OneDrive - Johns Hopkins/J1790/Data/J1790_Cibersort_GeneCounts.tsv", sep = '\t', quote = F, row.names = F)
+
+```
+
+# Load in SampleAnnot
+```{r}
+#SampAnnot <- read.xlsx("~/OneDrive - Johns Hopkins/J1790/Data/J1790 RNAseq Manifest Annotated FINAL.xlsx", sheetIndex = 1)
+SampAnnot <- read.xlsx(paste0(rootFolder,"/Data/J1790_SampleAnnotation_12132022.xlsx"), sheetIndex = 1, endRow = 41, colIndex = 1:10)
+
+rownames(SampAnnot) <- SampAnnot$Sample.Name
+
+# output some statistics
+table(SampAnnot$Timepoint)
+length(unique(SampAnnot$subject.ID))
+
+print(table(SampAnnot[,c("Timepoint","Bestresponse")], useNA = "ifany"))
+
+
+# remove NE
+#SampAnnot = SampAnnot %>% filter(Bestresponse != 'NE')
+# Combine PD and NE
+SampAnnot = SampAnnot %>% mutate(Response = factor(Bestresponse,
+                         levels = c('NE','SD','PD'),
+                         labels = c("PD",'SD','PD')))
+
+# change C4D1 to OnTX
+SampAnnot = SampAnnot %>% mutate(Timepoint = factor(Timepoint,
+                         levels = c('C4D1','PreTX'),
+                         labels = c("OnTX",'PreTX')))
+
+# add time on study cut-offs 90d and 180d
+SampAnnot$timeOnStudy90 = as.numeric(SampAnnot$Timeonstudy)> 90
+SampAnnot$timeOnStudy180 = as.numeric(SampAnnot$Timeonstudy)> 180
+
+SampAnnot$subject.ID = as.factor(SampAnnot$subject.ID)
+SampAnnot$Timepoint = factor(SampAnnot$Timepoint, levels = c("PreTX","OnTX"))
+
+datatable(SampAnnot)
+#saveRDS(SampAnnot, file = paste0(rootFolder,'Data/SampAnnot.rds'))
+
+#print(table(SampAnnot$Bestresponse))
+#print(table(SampAnnot$Timepoint))
+print(table(SampAnnot[,c("Timepoint","Bestresponse")]))
+
+print(table(SampAnnot[,c("Timepoint","Response")]))
+
+#print(summary(as.numeric(SampAnnot$Timeonstudy)))
+#print(table(as.numeric(SampAnnot$Timeonstudy)> 90))
+#print(table(as.numeric(SampAnnot$Timeonstudy)> 180))
+
+print(table(SampAnnot[,c("Timepoint","timeOnStudy90")], useNA = "ifany"))
+print(table(SampAnnot[,c("Timepoint","timeOnStudy180")], useNA = "ifany"))
+
+
+exprsDat = exprsDat[, rownames(SampAnnot)]
+
+# save RNAseq counts and sample annotation for further analysis
+#save(exprsDat,SampAnnot, file = paste0(outputFolder,"RNAseqData.rda"))
+
+# create DESeq object
+dds <- DESeqDataSetFromMatrix(countData = exprsDat, colData = SampAnnot, design = ~Timepoint+Bestresponse)
+
+# for plotting
+vst <- vst(dds)
+vstDat <- assay(vst)
+vstDat <- vstDat[apply(vstDat,1,sd)>0,]
+
+
+# select paired samples
+pairedPatID = SampAnnot[which(duplicated(SampAnnot$subject.ID)), "subject.ID"]
+print(c("Patients with paired samples",length(pairedPatID)))
+pairedSamp = SampAnnot %>% filter(subject.ID %in% pairedPatID) %>% select(Sample.Name) %>% unlist()
+
+
+```
+
+
+
+
+# Differential expression analysis
+## Paired analysis for pre- vs. on-treatment
+
+
+``` {r}
+# Get Pathways
+hallmark_df = msigdbr(species = "Homo sapiens", category = "H")
+hallmark_list = hallmark_df %>% split(x = .$gene_symbol, f = .$gs_name)
+
+```
+
+```{r}
+
+dds_paired <- DESeqDataSetFromMatrix(countData = exprsDat[,pairedSamp], colData = SampAnnot[pairedSamp,], design = ~subject.ID + Timepoint)
+dds_paired <- DESeq(dds_paired)
+
+#resultsNames(dds_paired)
+
+res_paired <- results(dds_paired, contrast = c("Timepoint","OnTX","PreTX"))
+res_paired <- res_paired[!is.na(res_paired$padj),]
+
+# save results
+datatable(as.data.frame(res_paired))
+write.csv(res_paired, file = paste0(outputFolder,"pairedDE_results.csv"))
+
+# Volcano plot
+EnhancedVolcano(res_paired, lab=row.names(res_paired), 
+                x='log2FoldChange', y='padj', FCcutoff = 0.5,
+                pCutoff = 0.05, title = "Paired DE Results by Time")
+
+# Heatmap of DE significant genes
+res_paired_DEGenes <- row.names(res_paired)[res_paired$padj < 0.05 &
+                              abs(res_paired$log2FoldChange) > 0.5]
+length(res_paired_DEGenes)
+
+# top annotation of the heatmap
+HA <- HeatmapAnnotation(df = SampAnnot[pairedSamp,c("Timepoint", "subject.ID","Response")],
+                        col=list(Timepoint = timeCol, Response = respCol))
+
+Heatmap(t(apply(vstDat[res_paired_DEGenes, pairedSamp],1,scale)),
+        top_annotation = HA,
+        clustering_distance_rows = 'pearson', 
+        clustering_distance_columns = 'pearson',
+        row_names_gp = gpar(fontsize = 6), 
+        column_labels = SampAnnot[pairedSamp,"subject.ID"],
+        column_title="Paired DE Results by Time")
+
+#====
+#Pathway analysis
+#Extract Stats for Pathway Analysis
+res_paired_stats <- res_paired$log2FoldChange
+names(res_paired_stats) <- row.names(res_paired)
+# GSEA on hallmark pathways  
+set.seed(123456)
+HALLMARK=fgsea(pathways=hallmark_list, stats=res_paired_stats)
+# plot all pathways
+#pathBarPlot(HALLMARK, ttl = "Hallmark pathways Enrichment Score from Paired Samples by Time")
+fgseaBarplot(HALLMARK, adjPvalThr = 0.05, 
+                        main_title = "Hallmark pathways Enrichment Score from Paired Samples by Time",
+                        sig_only = TRUE)
+datatable(HALLMARK)
+fwrite(as.data.frame(HALLMARK), file=paste0(outputFolder,"pairedDE_Hallmark.csv"))
+
+```
+
+## Pre-treatment only: Responders (SD) vs. nonresponders (PD)
+
+```{r}
+# select pre-treated samples only
+pretxSamp = SampAnnot %>% filter(Timepoint == 'PreTX') %>% select(Sample.Name) %>% unlist()
+
+dds_resp <- DESeqDataSetFromMatrix(countData = exprsDat[,pretxSamp], colData = SampAnnot[pretxSamp,], design = ~Response)
+dds_resp <- DESeq(dds_resp)
+#resultsNames(dds_paired)
+
+res_resp <- results(dds_resp, contrast = c("Response","SD","PD"))
+res_resp <- res_resp[!is.na(res_resp$padj),]
+
+# save results
+datatable(as.data.frame(res_resp))
+write.csv(res_resp, file = paste0(outputFolder,"preTx_response_DE_results.csv"))
+
+# Volcano plot
+EnhancedVolcano(res_resp, lab=row.names(res_resp), 
+                x='log2FoldChange', y='padj', FCcutoff = 0.5,
+                pCutoff = 0.05, title = "PreTX by response. Positive is higher in SD")
+
+# Heatmap of DE significant genes
+res_resp_DEGenes <- row.names(res_resp)[res_resp$padj < 0.05 &
+                              abs(res_resp$log2FoldChange) > 0.5]
+length(res_resp_DEGenes)
+
+# top annotation of the heatmap
+HA <- HeatmapAnnotation(df = data.frame(Response = SampAnnot[pretxSamp,c("Response")]),
+                        col=list(Timepoint = timeCol, Response = respCol))
+
+Heatmap(t(apply(vstDat[res_resp_DEGenes, pretxSamp],1,scale)),
+        top_annotation = HA,
+        clustering_distance_rows = 'pearson', 
+        clustering_distance_columns = 'pearson',
+        row_names_gp = gpar(fontsize = 6), 
+        column_title="PreTX by response")
+
+#====
+#Pathway analysis
+#Extract Stats for Pathway Analysis
+res_resp_stats <- res_resp$log2FoldChange
+names(res_resp_stats) <- row.names(res_resp)
+# GSEA on hallmark pathways  
+set.seed(123456)
+HALLMARK=fgsea(pathways=hallmark_list, stats=res_resp_stats)
+# plot  pathways
+fgseaBarplot(HALLMARK, adjPvalThr = 0.05, 
+                        main_title = "Hallmark pathways Enrichment Score from PreTX by response")
+datatable(HALLMARK)
+fwrite(as.data.frame(HALLMARK), file=paste0(outputFolder,"preTx_response_Hallmark.csv"))
+
+
+```
+
+## Pre-treatment only: time on study > 90
+
+```{r}
+# select pre-treated samples only without NA in timeOnStudy
+pretxSamp = SampAnnot %>% filter(Timepoint == 'PreTX' & !is.na(timeOnStudy90)) %>% select(Sample.Name) %>% unlist()
+
+dds_time <- DESeqDataSetFromMatrix(countData = exprsDat[,pretxSamp], colData = SampAnnot[pretxSamp,], design = ~timeOnStudy90)
+dds_time <- DESeq(dds_time)
+#resultsNames(dds_time)
+
+res_time <- results(dds_time, name = "timeOnStudy90TRUE")
+res_time <- res_time[!is.na(res_time$padj),]
+
+# save results
+datatable(as.data.frame(res_time))
+write.csv(res_time, file = paste0(outputFolder,"preTx_timeOnStudy_DE_results.csv"))
+
+# Volcano plot
+EnhancedVolcano(res_time, lab=row.names(res_time), 
+                x='log2FoldChange', y='padj', FCcutoff = 0.5,
+                pCutoff = 0.05, title = "PreTX  by time on study. Positive is higher in > 90")
+
+# Heatmap of DE significant genes
+res_time_DEGenes <- row.names(res_time)[res_time$padj < 0.05 &
+                              abs(res_time$log2FoldChange) > 0.5]
+length(res_time_DEGenes)
+
+# top annotation of the heatmap
+HA <- HeatmapAnnotation(df = SampAnnot[pretxSamp,c("Response","timeOnStudy90")],
+                        col=list(timeOnStudy90 = binaryCol, Response = respCol))
+
+Heatmap(t(apply(vstDat[res_time_DEGenes, pretxSamp],1,scale)),
+        top_annotation = HA,
+        clustering_distance_rows = 'pearson', 
+        clustering_distance_columns = 'pearson',
+        row_names_gp = gpar(fontsize = 6), 
+        column_title="PreTX by time on study")
+
+#====
+#Pathway analysis
+#Extract Stats for Pathway Analysis
+res_time_stats <- res_time$log2FoldChange
+names(res_time_stats) <- row.names(res_time)
+# GSEA on hallmark pathways  
+set.seed(123456)
+HALLMARK=fgsea(pathways=hallmark_list, stats=res_time_stats)
+# plot all pathways
+pathBarPlot(HALLMARK, ttl = "Hallmark pathways Enrichment Score from PreTX samples by time on study")
+
+```
+
+# Myeloid gene signature from Project 3
+
+```{r}
+myeloidGenes = unlist(read.csv(paste0(rootFolder,'Data/Myeloid_Genes.csv'), nrows = 1, header = F))
+myeloidGenes = intersect(myeloidGenes, rownames(vstDat))
+
+HA <- HeatmapAnnotation(df = SampAnnot[,c("Timepoint", "Response","timeOnStudy90","Arm")],
+                        col=list(Timepoint = timeCol, timeOnStudy90 = binaryCol, Response = respCol))
+
+Heatmap(t(apply(vstDat[myeloidGenes, ],1,scale)),
+        top_annotation = HA,
+        clustering_distance_rows = 'pearson', 
+        clustering_distance_columns = 'pearson',
+        row_names_gp = gpar(fontsize = 6), 
+        column_title="Myeloid genes. All samples")
+
+HA <- HeatmapAnnotation(df = SampAnnot[pretxSamp,c("Response","timeOnStudy90")],
+                        col=list(timeOnStudy90 = binaryCol, Response = respCol))
+
+Heatmap(t(apply(vstDat[myeloidGenes, pretxSamp],1,scale)),
+        top_annotation = HA,
+        clustering_distance_rows = 'pearson', 
+        clustering_distance_columns = 'pearson',
+        row_names_gp = gpar(fontsize = 6), 
+        column_title="Myeloid genes. PreTX samples")
+
+
+# top annotation of the heatmap
+HA <- HeatmapAnnotation(df = SampAnnot[pairedSamp,c("Timepoint", "subject.ID","Response")],
+                        col=list(Timepoint = timeCol, Response = respCol))
+
+Heatmap(t(apply(vstDat[myeloidGenes, pairedSamp],1,scale)),
+        top_annotation = HA,
+        clustering_distance_rows = 'pearson', 
+        clustering_distance_columns = 'pearson',
+        row_names_gp = gpar(fontsize = 6), 
+        column_labels = SampAnnot[pairedSamp,"subject.ID"],
+        column_title="Myeloid genes. Paired samples",
+        show_row_names  = F)
+
+#==========
+# do FDR for myeloid genes only
+myeloidFDR = cbind(paired = p.adjust(res_paired[myeloidGenes,'pvalue'], method = 'BH'),
+                   byResp = p.adjust(res_resp[myeloidGenes,'pvalue'], method = 'BH'),
+                   byTime = p.adjust(res_time[myeloidGenes,'pvalue'], method = 'BH'))
+rownames(myeloidFDR) = myeloidGenes
+myeloidFDR = myeloidFDR[order(myeloidFDR[,1]),]
+#sum(myeloidFDR < 0.05, na.rm = T)
+
+# GSEA on myeloid genes
+set.seed(123456)
+
+myeloidGSEA= rbind(fgsea(pathways=list(paired = myeloidGenes), stats=res_paired_stats),
+                fgsea(pathways=list(byResp = myeloidGenes), stats=res_resp_stats),
+                fgsea(pathways=list(byTime = myeloidGenes), stats=res_time_stats))
+print("Pathway analysis using myeloid genes from Project 3 as a set")
+datatable(myeloidGSEA)
+```
+
+# Myeloid genes sets from xCell paper:
+
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5688663/
+
+```{r}
+library(GSA)
+# read in selected pathways from xCell paper
+myeloidPathways = GSA.read.gmt(paste0(rootFolder,'Data/moremyeloidgenelists.txt'))
+# remove empty entries in the sets
+myeloidPathways$genesets = lapply(myeloidPathways$genesets, function(x) x[which(x != "")])
+names(myeloidPathways$genesets) = myeloidPathways$geneset.names
+set.seed(123456)
+myeloidPathwaysRes = list(paired = fgsea(myeloidPathways$genesets, stats=res_paired_stats),
+                          byResp = fgsea(myeloidPathways$genesets, stats=res_resp_stats),
+                          byTime = fgsea(myeloidPathways$genesets, stats=res_time_stats))
+
+print("Pathway analysis using myeloid genes from xCell paper as a set./n Results from the paired analysis")
+datatable(myeloidPathwaysRes$paired)
+print("Results from the preTx by response analysis")
+datatable(myeloidPathwaysRes$byResp)
+
+fwrite(as.data.frame(myeloidPathwaysRes$paired), file=paste0(outputFolder,"paired_xCell_myeloid.csv"))
+fwrite(as.data.frame(myeloidPathwaysRes$byResp), file=paste0(outputFolder,"preTx_response_xCell_myeloid.csv"))
+
+
+# plot myeloid pathways
+pathBarPlot(myeloidPathwaysRes$paired, ttl = "Myeloid pathways Enrichment Score from paired analysis")
+pathBarPlot(myeloidPathwaysRes$byResp, ttl = "Myeloid pathways Enrichment Score from from PreTX samples by response")
+# plot  pathways
+fgseaBarplot(myeloidPathwaysRes$byResp, adjPvalThr = 0.05, 
+                        main_title = "Myeloid pathways Enrichment Score from from PreTX samples by response")
+
+pathBarPlot(myeloidPathwaysRes$byTime, ttl = "Myeloid pathways Enrichment Score from PreTX samples by time on study")
+
+```
+
+
+
+
